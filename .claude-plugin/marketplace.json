@@ -1,0 +1,12 @@
+{
+  "name": "descript-skills",
+  "owner": { "name": "Alex (alexaiarchitect)" },
+  "description": "Descript skills for Claude Code",
+  "plugins": [
+    {
+      "name": "descript",
+      "source": "./",
+      "description": "Manage Descript projects and compositions: render slides, upload media, export transcripts, plan placement, gated Underlord edits, publishing."
+    }
+  ]
+}
