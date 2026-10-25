@@ -1,7 +1,7 @@
 {
-  "name": "descript",
-  "version": "0.1.0",
-  "description": "Manage Descript projects and compositions from Claude Code: render HTML decks to slides, upload media, export transcripts, plan slide placement, run gated Underlord edits, publish share links.",
+  "name": "descript-api",
+  "version": "0.2.0",
+  "description": "REST/CLI companion to Descript's official MCP plugin: render HTML decks to slides, upload media into projects or the Media Library, search, export transcripts, plan slide placement, run gated Underlord edits, publish share links.",
   "author": { "name": "Alex (alexaiarchitect)" },
   "homepage": "https://github.com/alexaiarchitect/descript-skills#readme",
   "repository": "https://github.com/alexaiarchitect/descript-skills",

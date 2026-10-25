@@ -214,6 +214,7 @@ function renderPrompt(mode) {
   const rules = `HARD RULES
 - Keep all audio, all words, all existing cuts, captions, and the total runtime exactly as they are. Do not remove or add speech.
 - Do not add transitions, spacer scenes, black frames, gaps, silence, stock media, music, titles, or text overlays.
+- No generated music, sound effects, or layout changes: do not generate or add music or SFX, and do not search for or apply layout packs.
 - Place every split on a word boundary: between two words, preferably at the end of a sentence, never inside a word. Move a split by up to ±1.0 s from the requested time if that is what it takes. Report the final time of every split you made.
 - Use only the ${rows.length} media names listed above, exactly as written (folder "${folder}/"). If one cannot be found, leave that scene empty and report it; do not substitute other media.
 - Do not touch media in any other folder.

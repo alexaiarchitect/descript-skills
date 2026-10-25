@@ -4,9 +4,9 @@
   "description": "Descript skills for Claude Code",
   "plugins": [
     {
-      "name": "descript",
+      "name": "descript-api",
       "source": "./",
-      "description": "Manage Descript projects and compositions: render slides, upload media, export transcripts, plan placement, gated Underlord edits, publishing."
+      "description": "REST/CLI companion to Descript's official MCP plugin: render HTML decks to slides, upload media into projects or the Media Library, search, export transcripts, plan slide placement, run gated Underlord edits, publish share links."
     }
   ]
 }

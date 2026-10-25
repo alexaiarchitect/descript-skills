@@ -19,6 +19,7 @@ Structure that worked:
    every scene, no layout/template change, no new layers; (c) fill each placeholder with the named image (fit, no crop, static).
 4. **Table** — scene #, start, end, exact media name, plus the spoken cue at each start so the agent can check the transcript.
 5. **HARD RULES** — keep audio/words/cuts/captions/runtime; no transitions, spacers, black frames, gaps, music, titles;
+   no generated music, sound effects, or layout changes (no layout packs);
    every split on a word boundary (sentence end preferred, ±1 s allowed) and **report the final split times**; use only the
    listed names, leave empty + report rather than substitute; do not touch other folders.
 6. **REPORT BACK** — table of final scene timings + placed media + per-scene layout/camera confirmation + anything not done.
@@ -40,6 +41,8 @@ Rules:
 - Place IN/OUT points on word boundaries in the transcript; never overlap two slides.
 - Between slides, show the camera recording as-is.
 - Do not rename, duplicate, or re-import media. Use only the names listed above.
+- No generated music, sound effects, or layout changes: do not generate or add music or SFX, and do not search for or
+  apply layout packs.
 Return a summary table: slide name, final in/out timecodes, layout used, and anything you could not do.
 ```
 
@@ -53,6 +56,16 @@ Rules that avoided past failures:
 - "Treat timestamp labels, Markdown fences, and command blocks as editorial markup; do not narrate them."
 - "Do not show local file paths or repository names in on-screen text."
 - "Return a concise summary of what changed and any manual review items."
+
+## Descript's own guidance (2026)
+- Describe the **end state**, with exact specs: fonts, hex colours, positions, durations, canvas size, media names.
+- API agent runs never ask follow-up questions; they assume and finish. Resolve every ambiguity in the prompt.
+- MCP `prompt_project_agent` continues the conversation by default; the API continues only with `conversation_id`
+  (`--conversation <uuid>`). Without it every job starts fresh.
+- Underlord v2 runs an automatic review pass after every turn. That is not verification — still run the checklist below.
+- Underlord can generate music and sound effects and look up layout packs. In "keep as is" prompts exclude them
+  explicitly (the HARD RULES of both templates and of `plan-slides.mjs --prompt-out` do).
+- Thinking is capped at 200 AI credits per turn; jump-cut smoothing costs 0.5 credits/s of audio, 1.0/s of video.
 
 ## Follow-ups
 Reuse `--conversation <uuid>` from the previous job so Underlord sees the earlier turns ("move the split between scenes 4

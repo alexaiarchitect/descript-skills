@@ -1,22 +1,23 @@
 ---
-name: descript
-description: Manage Descript projects and compositions through the public REST API — list projects/compositions, resolve a web.descript.com URL to IDs, render an HTML slide deck to PNG slides, upload slides/media into a project folder, export transcripts with timecodes, plan slide placement against the narration, run gated Underlord (AI agent) edits, publish share links, and track jobs/credits. Use for any request mentioning Descript, Underlord, a Descript composition or project URL, "add slides/media to Descript", Descript transcript export, or Descript publishing.
+name: descript-api
+description: Manage Descript projects and compositions through the public REST API — list projects/compositions, resolve a web.descript.com URL to IDs, render an HTML slide deck to PNG slides, upload slides/media into a project folder or the Media Library, search media (incl. where a phrase is spoken), export transcripts with timecodes, plan slide placement against the narration, run gated Underlord (AI agent) edits, publish share links, and track jobs/credits. Use for any request mentioning Descript, Underlord, a Descript composition or project URL, "add slides/media to Descript", Descript transcript export, or Descript publishing.
 ---
 
-# Descript skill
+# Descript API skill (`descript-api`)
 
-Zero-dependency Node scripts (Node ≥ 20; 24 recommended) that talk to `https://descriptapi.com/v1`.
+Zero-dependency Node scripts (Node ≥ 20; 24 recommended) that talk to `https://descriptapi.com/v1` (OpenAPI v1.2).
+REST/CLI companion to Descript's official MCP plugin (`references/mcp.md`); both can be installed together.
 
 Scripts live in `scripts/` next to this file:
 
 | Installed as | Script path prefix |
 |---|---|
-| plugin | `${CLAUDE_PLUGIN_ROOT}/skills/descript/scripts/` |
-| symlink / copy in `~/.claude/skills/descript` | `~/.claude/skills/descript/scripts/` |
+| plugin | `${CLAUDE_PLUGIN_ROOT}/skills/descript-api/scripts/` |
+| symlink / copy in `~/.claude/skills/descript-api` | `~/.claude/skills/descript-api/scripts/` |
 
 If `${CLAUDE_PLUGIN_ROOT}` appears unexpanded, use the second form. Below, `$S` stands for that prefix.
 
-- `descript.mjs` — API client (projects, media upload, transcript, agent, publish, jobs)
+- `descript.mjs` — API client (projects, search, project/Media Library upload, transcript, agent, publish, jobs)
 - `render-deck.mjs` — HTML deck → one 1920x1080 PNG per slide + `manifest.json`
 - `plan-slides.mjs` — manifest + SRT → placement plan (IN/OUT per slide) + ready-to-send Underlord prompt
 
@@ -28,8 +29,11 @@ node $S/descript.mjs status        # → "API v1 · drive: <name>"
 Token sources, in order: `DESCRIPT_TOKEN` env → `DESCRIPT_ENV_FILE` → nearest `.env` (cwd upward, then the plugin root)
 → `~/.config/descript/.env` → `~/.descript-cli/config.json`. Tokens come from Descript → Settings → API.
 Never print, paste, or commit the token. On 401, ask the user to refresh it.
-Optional extras: official CLI `descript-api` (`npm i -g @descript/platform-cli@latest`, Node 24) and the Descript MCP
-(`claude mcp add --transport http descript https://api.descript.com/v2/mcp -s user`) — see `references/api.md`.
+Models: `models` lists ids, aliases and cost tiers; `--model` accepts an id or a family alias (`claude-opus` → newest
+Opus). `claude-opus-5.5` is Descript's default on Enterprise drives; `auto` is the API default.
+Optional extras: official CLI `descript-api` (`npm i -g @descript/platform-cli@latest`, Node 24; `@next` adds
+`edit --new --prompt`) and the official MCP plugin (`/plugin marketplace add descriptinc/descript-mcp`, then
+`/plugin install descript@descript`) — see `references/api.md` and `references/mcp.md`.
 
 ## 2. Core workflow: slides onto a recorded lesson
 
@@ -64,16 +68,23 @@ Optional extras: official CLI `descript-api` (`npm i -g @descript/platform-cli@l
    `references/placement-record.md`) with job IDs, credits, media names, and the timeline. Job history expires after 30 days.
 
 Other tasks map onto the same commands: `projects`/`project` to browse, `transcript` alone for exports, `publish` for
-share links, `jobs`/`job`/`cancel` for monitoring, `search` to find media by name.
+share links, `published <slug>` to look up a share link, `jobs`/`job`/`cancel` for monitoring, `search` to find media.
+- **Find a phrase in a recording:** `search --query "exact phrase" --match content --type video` → each hit carries a
+  `moment` (start–end seconds) — a quick cross-check for IN points.
+- **Media Library (Drive-wide, not a project):** `library-upload --folder-id root <files>` (`--dry-run` first) →
+  per-file status, media seconds, asset ids. There is no REST delete; remove test assets in the app.
 
 ## 3. Cost and safety gates
 
-- `upload` of audio/video consumes **media minutes** (images ≈ 1 s each). Always show the file list first.
+- `upload` / `library-upload` consume **media minutes** (images ≈ 1 s each). Always show the file list first.
 - `agent` consumes **AI credits**. Observed: 12-scene split + placeholder fill on an existing recording with
   `claude-opus-5.5` ≈ 24 credits; legacy build-a-lesson-from-scratch runs 50–130. Requires `--yes`; confirm with the user
   every time, quoting model and composition. One comprehensive prompt beats several small ones; follow-ups reuse
-  `--conversation <uuid>`. A 402 mid-run leaves the composition half-edited — inspect before re-running.
-- `publish` creates an outward-facing share link; requires `--yes`. Default to `--access unlisted`.
+  `--conversation <uuid>` (API runs never continue implicitly and never ask follow-up questions). Thinking is capped at
+  200 credits per turn; jump-cut smoothing costs 0.5 credits/s (audio) or 1.0/s (video); Studio Sound / filler-word
+  removal is capped at 30 credits per file. A 402 mid-run leaves the composition half-edited — inspect before re-running.
+- `publish` creates an outward-facing share link; requires `--yes`. Default to `--access unlisted`. A 422 means the
+  composition is audio-only: use `--media-type Audio`.
 - Never run an agent edit while another job on the same composition is `running` (`jobs --project <id>`).
 - Before the first agent edit of a valuable composition, ask the user to duplicate it in Descript as a backup.
 - Never commit `.env`, tokens, signed upload URLs, or the user's recordings/transcripts to a public repo.
@@ -84,13 +95,16 @@ share links, `jobs`/`job`/`cancel` for monitoring, `search` to find media by nam
 - Slides: `slide-NN-<slug>.png` (render-deck does this). Videos: `<Comp>-<purpose>.mp4` via `--name-map src=dst`.
 - Composition refs accept UUID, 5-char short ID (first 5 hex chars of the UUID), exact name, or the web URL.
 
-## 5. Known limits (verified 2026-10-26)
+## 5. Known limits (verified 2026-10-29)
 
 - No REST endpoint reads or edits the timeline deterministically; placement = Underlord prompt or manual work.
   To document a timeline, combine transcript export (`--markers`) with Claude in Chrome on the web.descript.com URL.
+  Timeline *export* (EDL, FCPXML, Premiere, Resolve, AAF, Audition) exists only via the MCP `export_timeline` tool —
+  see `references/mcp.md`; there is still no REST timeline read.
 - Underlord is non-deterministic: it may compress runtime, loop/freeze short videos, insert spacer scenes, cut mid-word,
   or skip verification it was asked for. State explicit rules in the prompt and verify in Descript before publishing.
-- `GET /jobs` keeps 30 days; `callback_url` exists on import/agent/publish if polling is undesirable.
+- `GET /jobs` keeps 30 days; `callback_url` (unsigned POST of the job payload) exists on import/agent/publish.
+- Errors arrive as `{error, message}` (e.g. `payment_required: …`); see `references/api.md` → Error codes.
 - Rate limits: honour `Retry-After` on 429 (the script retries 3×).
 - `render-deck.mjs` needs a local Chrome/Chromium/Edge (`--chrome <path>` or `CHROME_PATH`); Google Fonts load over the network.
 
@@ -104,9 +118,14 @@ $D project <project-id>                      # compositions + media folder summa
 $D project <project-id> --media --folder Lesson04
 $D resolve "https://web.descript.com/<project>/<short>" --json
 $D upload --project <id> --folder Lesson04 output/Lesson04/slide-*.png [--dry-run] [--json]
+$D library-upload --folder-id root logo.png [--dry-run] [--json]      # Media Library, not a project
 $D transcript --project <id> --composition <short|name> --format srt --out file.srt
-$D jobs --project <id>          |  $D job <job-id> --wait   |  $D cancel <job-id>
-$D models                        |  $D search --query "slide-04" --type image
+$D projects --updated-after 2026-10-01 --limit 10
+$D jobs --project <id> [--type import/project_media|import/drive_media|agent|publish]
+$D job <job-id> --wait           |  $D cancel <job-id>   |  $D models
+$D search --query "slide-04" --type image [--sort newest] [--updated-after ISO] [--owner UUID]
+$D search --query "four options" --match content --type video          # moment start–end
+$D published <share-slug> [--json]                                    # download_url, expiry, privacy
 $D agent --project <id> --composition <ref> --prompt-file prompt.md --model claude-opus-5.5 --dry-run
 $D agent --project <id> --composition <ref> --prompt-file prompt.md --model claude-opus-5.5 --wait --yes --out job.json
 $D publish --project <id> --composition <ref> --resolution 1080p --access unlisted --wait --yes

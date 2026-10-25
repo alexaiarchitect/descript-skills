@@ -16,15 +16,19 @@ import { homedir } from "node:os";
 
 const API_BASE_URL = (process.env.DESCRIPT_API_BASE_URL || "https://descriptapi.com/v1").replace(/\/+$/, "");
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
-const PLUGIN_ROOT = resolve(SCRIPT_DIR, "../../.."); // <repo>/skills/descript/scripts → <repo>
+const PLUGIN_ROOT = resolve(SCRIPT_DIR, "../../.."); // <repo>/skills/descript-api/scripts → <repo>
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHORT_RE = /^[0-9a-f]{5}$/i;
+const JOB_TYPES = ["import/project_media", "import/drive_media", "agent", "publish"];
 const EXIT = { OK: 0, ERROR: 1, JOB_FAILED: 2, TIMEOUT: 3 };
 
 const CONTENT_TYPES = {
   ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif",
   ".mp4": "video/mp4", ".mov": "video/quicktime", ".m4v": "video/x-m4v", ".webm": "video/webm",
   ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
+  // added to Descript's supported formats in 2026
+  ".avif": "image/avif", ".mkv": "video/x-matroska", ".avi": "video/x-msvideo", ".ts": "video/mp2t", ".mxf": "application/mxf",
+  ".opus": "audio/opus",
 };
 
 class CliError extends Error {
@@ -35,8 +39,8 @@ async function main() {
   const [command, ...rawArgs] = process.argv.slice(2);
   const args = parseArgs(rawArgs);
   const commands = {
-    status, projects, project, resolve: resolveCmd, upload, agent, jobs, job, cancel,
-    transcript, publish, models, search, help: () => printHelp(),
+    status, projects, project, resolve: resolveCmd, upload, library_upload: libraryUpload, agent, jobs, job, cancel,
+    transcript, publish, published, models, search, help: () => printHelp(),
   };
   if (!command || command === "-h" || command === "--help") return printHelp();
   const fn = commands[command.replaceAll("-", "_")] || commands[command];
@@ -53,12 +57,17 @@ TARGETS: wherever an ID is accepted you may pass a UUID, a 5-char short ID (comp
 Read-only (free):
   status                                   Token check: drive name/id, api version
   projects [--name X] [--all] [--limit N] [--sort updated_at] [--json]
+           [--updated-after ISO] [--updated-before ISO] [--created-after ISO] [--created-before ISO]
   project <id|url> [--media] [--folder F] [--json]      Compositions (+ media files, optionally one folder)
   resolve <url|short|name> [--project ID]  Print project + composition UUID/name for a URL or short ID
-  jobs [--project ID] [--type agent|import/project_media] [--limit N] [--json]
+  jobs [--project ID] [--type import/project_media|import/drive_media|agent|publish] [--limit N] [--json]
   job <job-id> [--wait] [--interval 5] [--max 240] [--json]
-  models                                   Agent models + aliases with cost tier
-  search --query "text" [--type image|video|audio|project] [--match name|content] [--limit N] [--json]
+  models [--json]                          Agent models + aliases (cost tier, description). --model also accepts
+                                           family aliases (claude-opus → newest Opus); "auto" is the default.
+  search --query "text" [--type image|video|audio|project|...] [--match name|content|visual]
+         [--sort relevance|newest|oldest] [--owner UUID[,UUID]] [--updated-after ISO] [--updated-before ISO]
+         [--limit N] [--json]              --match content returns moment start–end: where a phrase is spoken
+  published <slug> [--json]                Published project by share slug (download_url, expiry, privacy, metadata)
   transcript --project ID --composition ID --format srt|markdown|txt|html|rtf|docx
              [--timecodes SECONDS] [--markers] [--speakers off|changes|every_paragraph] --out FILE
 
@@ -66,12 +75,17 @@ Writes (media minutes / AI credits / outward-facing — confirm with the user fi
   upload --project ID --folder NAME <files...> [--name-map src=dst,...] [--language en]
          [--composition NEWNAME [--width 1920 --height 1080]] [--force] [--no-wait] [--dry-run] [--json]
          Direct-upload local files into an existing project. Refuses exact media-name collisions unless --force.
+  library-upload [--folder-id root|UUID] <files...> [--language en] [--no-wait] [--dry-run] [--json]
+         Direct-upload local files into the Drive's Media Library (POST /jobs/import/drive_media), not a project.
+         --folder-id defaults to root. Prints per-file status, media seconds used, folder id, asset ids.
+         There is no REST delete: remove test assets in the Descript app.
   agent --project ID --composition ID (--prompt "..." | --prompt-file F) [--model auto]
         [--conversation UUID] [--wait] [--yes] [--dry-run] [--out result.json] [--json]
         Underlord edit of a composition. Billable: requires --yes (or --dry-run to print the payload only).
         --out saves the raw job result (agent_response, credits, conversation_id) for the placement record.
   publish --project ID --composition ID [--resolution 1080p] [--access unlisted|public|drive|private]
           [--media-type Video|Audio] [--wait] [--yes] [--dry-run] [--json]
+          Billable/outward-facing: requires --yes. 422 = Video requested on an audio-only composition.
   cancel <job-id>
 
 Exit codes: 0 ok · 1 error/validation · 2 job finished but result.status != success · 3 poll timeout
@@ -178,8 +192,14 @@ async function request(path, options = {}, attempt = 1) {
   const body = text ? safeJson(text) : null;
   if (!response.ok) {
     const hint = ["Retry-After", "X-RateLimit-Remaining"].map((h) => (response.headers.get(h) ? `${h}: ${response.headers.get(h)}` : null)).filter(Boolean).join(", ");
+    // v1.2 error body: {error: "<code>", message: "..."} (codes: invalid_input, payment_required, forbidden,
+    // not_found, unprocessable_entity, rate_limit_exceeded). Older bodies may nest {error: {message}}.
+    const code = typeof body?.error === "string" && body?.message ? body.error : null;
     const message = body?.message || body?.error?.message || body?.error || text || "Request failed";
-    throw new CliError(`Descript API ${response.status}: ${typeof message === "string" ? message : JSON.stringify(message)}${hint ? ` (${hint})` : ""}`);
+    const err = new CliError(`Descript API ${response.status}: ${code ? `${code}: ` : ""}${typeof message === "string" ? message : JSON.stringify(message)}${hint ? ` (${hint})` : ""}`);
+    err.status = response.status;
+    err.code = code;
+    throw err;
   }
   return body;
 }
@@ -237,6 +257,7 @@ async function status(args) {
 async function projects(args) {
   const query = new URLSearchParams({ limit: String(args.limit || 100), sort: args.sort || "updated_at", direction: args.direction || "desc" });
   if (args.name) query.set("name", args.name);
+  for (const key of ["updated_after", "updated_before", "created_after", "created_before"]) if (args[key]) query.set(key, String(args[key]));
   const all = [];
   let cursor = "";
   do {
@@ -261,14 +282,14 @@ async function project(args) {
   if (args.json) {
     return console.log(JSON.stringify(args.media ? { ...p, media_files: Object.fromEntries(filtered) } : { ...p, media_files: undefined, media_count: media.length }, null, 2));
   }
-  console.log(`Project: ${p.name}\nID: ${p.id}\nDrive: ${p.drive_name || p.drive_id}\nUpdated: ${p.updated_at}\nMedia files: ${media.length} · Compositions: ${(p.compositions || []).length} · Publishes: ${(p.publishes || []).length}\n`);
+  console.log(`Project: ${p.name}\nID: ${p.id}\nDrive: ${p.drive_name || p.drive_id || "-"}\nUpdated: ${p.updated_at}\nMedia files: ${media.length} · Compositions: ${(p.compositions || []).length} · Publishes: ${(p.publishes || []).length}\n`);
   console.log(pad("Composition ID", 38) + pad("Short", 7) + pad("Type", 7) + pad("Duration", 10) + "Name");
   for (const c of p.compositions || []) {
     console.log(pad(c.id, 38) + pad(c.id.slice(0, 5), 7) + pad(c.media_type || "", 7) + pad(fmtDuration(c.duration), 10) + c.name);
   }
   if (p.publishes?.length) {
     console.log("\nPublishes:");
-    for (const pub of p.publishes) console.log(`- ${pub.name} [${pub.access_level}] ${pub.share_url} (composition ${pub.composition_id})`);
+    for (const pub of p.publishes) console.log(`- ${pub.name} [${pub.access_level}${pub.media_type ? `, ${String(pub.media_type).toLowerCase()}` : ""}] ${pub.share_url} (composition ${pub.composition_id})`);
   }
   if (args.media) {
     console.log(`\nMedia${folderFilter ? ` in ${folderFilter}/` : ""}: ${filtered.length}`);
@@ -301,13 +322,22 @@ async function resolveCmd(args) {
 async function jobs(args) {
   const query = new URLSearchParams({ limit: String(args.limit || 20) });
   if (args.project) query.set("project_id", requireProjectId(args));
-  if (args.type) query.set("type", args.type);
+  if (args.type) {
+    if (!JOB_TYPES.includes(String(args.type))) throw new CliError(`--type must be one of: ${JOB_TYPES.join(", ")}`);
+    query.set("type", args.type);
+  }
   const page = await request(`/jobs?${query}`);
   if (args.json) return console.log(JSON.stringify(page, null, 2));
+  if (!(page.data || []).length) return console.log("No jobs found (job history covers the last 7 days by default, 30 max).");
   for (const j of page.data || []) {
     const r = j.result || {};
-    console.log(`${j.created_at}  ${pad(j.job_type, 22)} ${pad(j.job_state, 10)} ${pad(r.status || j.progress?.label || "", 10)} ${j.job_id}${r.ai_credits_used != null ? `  credits=${r.ai_credits_used}` : ""}${r.media_seconds_used != null ? `  media_s=${r.media_seconds_used}` : ""}`);
+    console.log(`${j.created_at}  ${pad(j.job_type, 22)} ${pad(j.job_state, 10)} ${pad(r.status || j.progress?.label || "", 10)} ${j.job_id}${r.ai_credits_used != null ? `  credits=${r.ai_credits_used}` : ""}${r.media_seconds_used != null ? `  media_s=${r.media_seconds_used}` : ""}${jobExtras(j)}`);
   }
+}
+
+function jobExtras(j) {
+  const errorCode = j.result?.error_code || j.error_code;
+  return `${j.stopped_at ? `  stopped=${j.stopped_at}` : ""}${errorCode ? `  error_code=${errorCode}` : ""}`;
 }
 
 async function job(args) {
@@ -335,16 +365,41 @@ async function models(args) {
   console.log("Models:");
   for (const x of m.availableModels || []) console.log(`- ${pad(x.id, 22)} cost=${x.cost}`);
   console.log("Aliases:");
-  for (const a of m.aliases || []) console.log(`- ${pad(a.id, 22)} → ${a.resolvesTo} (${a.cost})`);
+  for (const a of m.aliases || []) console.log(`- ${pad(a.id, 22)} → ${a.resolvesTo} (${a.cost})${a.description ? `  ${a.description}` : ""}`);
+  console.log("Pass any model id or alias to agent --model; family aliases (e.g. claude-opus) resolve to the newest model of that family.");
 }
+
+const SEARCH_SORTS = ["relevance", "newest", "oldest"];
 
 async function search(args) {
   if (!args.query) throw new CliError("--query is required");
+  if (args.sort && !SEARCH_SORTS.includes(String(args.sort))) throw new CliError(`--sort must be one of: ${SEARCH_SORTS.join(", ")}`);
   const query = new URLSearchParams({ query: String(args.query), limit: String(args.limit || 30) });
-  for (const key of ["type", "match", "sort"]) if (args[key]) query.append(key, String(args[key]));
+  for (const key of ["type", "match"]) {
+    if (args[key]) for (const v of String(args[key]).split(",").map((s) => s.trim()).filter(Boolean)) query.append(key, v);
+  }
+  if (args.sort) query.set("sort", String(args.sort));
+  if (args.owner) for (const o of String(args.owner).split(",").map((s) => s.trim()).filter(Boolean)) query.append("owner[]", o);
+  for (const key of ["updated_after", "updated_before"]) if (args[key]) query.set(key, String(args[key]));
   const res = await request(`/search?${query}`);
   if (args.json) return console.log(JSON.stringify(res, null, 2));
-  for (const r of res.results || []) console.log(`${pad(r.type, 10)} ${r.name}  ${r.url || ""}${r.project_id ? `  project=${r.project_id}` : ""}`);
+  if (!(res.results || []).length) return console.log("No results.");
+  for (const r of res.results || []) {
+    const m = r.moment;
+    const moment = m && (m.start_time_sec != null || m.end_time_sec != null) ? `  @ ${fmtDuration(m.start_time_sec)}–${fmtDuration(m.end_time_sec)}` : "";
+    const where = r.location ? `  [${r.location}]` : "";
+    const dur = typeof r.duration === "number" ? `  (${fmtDuration(r.duration)})` : "";
+    console.log(`${pad(r.type, 10)} ${r.name}${where}${dur}${moment}  ${r.url || ""}${r.project_id ? `  project=${r.project_id}` : ""}`);
+  }
+}
+
+async function published(args) {
+  const slug = args._[0];
+  if (!slug || slug === true) throw new CliError("Usage: published <slug> [--json]   (slug = last path segment of the share URL)");
+  const clean = String(slug).replace(/^https?:\/\/[^/]+\/(?:view\/)?/i, "").replace(/[/?#].*$/, "");
+  const p = await request(`/published_projects/${encodeURIComponent(clean)}`);
+  if (args.json) return console.log(JSON.stringify(p, null, 2));
+  for (const [k, v] of Object.entries(p || {})) console.log(`${k}: ${v !== null && typeof v === "object" ? JSON.stringify(v) : v}`);
 }
 
 async function transcript(args) {
@@ -405,14 +460,7 @@ async function upload(args) {
 
   console.error(`Requesting upload URLs for ${items.length} file(s) → ${projectBefore.name} ${folder ? `(${folder}/)` : ""}`);
   const importJob = await request("/jobs/import/project_media", { method: "POST", body: JSON.stringify(payload) });
-  for (const i of items) {
-    const u = importJob.upload_urls?.[i.mediaName]?.upload_url;
-    if (!u) throw new CliError(`No upload URL returned for ${i.mediaName}`);
-    let res = await fetch(u, { method: "PUT", headers: { "Content-Type": i.contentType }, body: readFileSync(i.localPath) });
-    if (!res.ok) res = await fetch(u, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: readFileSync(i.localPath) });
-    if (!res.ok) throw new CliError(`Upload failed for ${i.mediaName}: ${res.status} ${await res.text()}`);
-    console.error(`  uploaded ${i.mediaName} (${(i.fileSize / 1024).toFixed(0)} KB)`);
-  }
+  await putUploads(items, importJob.upload_urls);
   if (args.wait === false) return console.log(JSON.stringify({ job_id: importJob.job_id, project_url: importJob.project_url, uploaded: items.map((i) => i.mediaName) }, null, 2));
 
   const done = await waitForJob(importJob.job_id, { intervalSeconds: Number(args.interval || 5), maxAttempts: Number(args.max || 240), quiet: Boolean(args.json) });
@@ -430,6 +478,50 @@ async function upload(args) {
     for (const u of result.uploaded) console.log(`- ${u.requested}${u.live && u.live !== u.requested ? `  → live as ${u.live}` : u.live ? "" : "  (NOT FOUND in project yet)"}`);
     if (result.created_compositions.length) console.log(`Created compositions: ${result.created_compositions.map((c) => `${c.name} (${c.id})`).join(", ")}`);
     console.log(`Open: ${result.project_url}`);
+  }
+  if (result.status !== "success") process.exitCode = EXIT.JOB_FAILED;
+}
+
+async function libraryUpload(args) {
+  const files = args._;
+  if (!files.length) throw new CliError("Usage: library-upload [--folder-id root|UUID] <files...> [--language en] [--no-wait] [--dry-run] [--json]");
+  const folderId = args.folder_id && args.folder_id !== true ? String(args.folder_id) : "root";
+  if (folderId !== "root" && !UUID_RE.test(folderId)) throw new CliError(`--folder-id must be "root" or a Media Library folder UUID: ${folderId}`);
+  // Media Library names are plain basenames (no folder prefix); the folder is chosen by folder_id.
+  const items = files.map((f) => {
+    const localPath = resolvePath(f);
+    if (!existsSync(localPath) || !statSync(localPath).isFile()) throw new CliError(`Not a file: ${localPath}`);
+    const contentType = CONTENT_TYPES[extname(localPath).toLowerCase()];
+    if (!contentType) throw new CliError(`Unsupported file type: ${localPath}`);
+    const base = basename(localPath);
+    return { localPath, mediaName: base, baseName: base, contentType, fileSize: statSync(localPath).size };
+  });
+  const dupes = items.map((i) => i.mediaName).filter((n, i, a) => a.indexOf(n) !== i);
+  if (dupes.length) throw new CliError(`Duplicate upload names: ${[...new Set(dupes)].join(", ")}`);
+
+  const addMedia = {};
+  for (const i of items) addMedia[i.mediaName] = { content_type: i.contentType, file_size: i.fileSize, ...(args.language ? { language: String(args.language) } : {}) };
+  const payload = { folder_id: folderId, add_media: addMedia };
+  if (args.callback_url) payload.callback_url = String(args.callback_url);
+  if (args.dry_run) return console.log(JSON.stringify(payload, null, 2));
+
+  console.error(`Requesting Media Library upload URLs for ${items.length} file(s) → folder ${folderId}`);
+  const importJob = await request("/jobs/import/drive_media", { method: "POST", body: JSON.stringify(payload) });
+  await putUploads(items, importJob.upload_urls);
+  const assetIds = Object.fromEntries(items.map((i) => [i.mediaName, importJob.upload_urls?.[i.mediaName]?.asset_id ?? null]));
+  if (args.wait === false) return console.log(JSON.stringify({ job_id: importJob.job_id, folder_id: folderId, asset_ids: assetIds }, null, 2));
+
+  const done = await waitForJob(importJob.job_id, { intervalSeconds: Number(args.interval || 5), maxAttempts: Number(args.max || 240), quiet: Boolean(args.json) });
+  const r = done.result || {};
+  const result = {
+    job_id: importJob.job_id, job_state: done.job_state, status: r.status, folder_id: done.folder_id || r.folder_id || folderId,
+    media_seconds_used: r.media_seconds_used, error_code: r.error_code, stopped_at: done.stopped_at,
+    files: items.map((i) => ({ name: i.mediaName, asset_id: assetIds[i.mediaName], ...(r.media_status?.[i.mediaName] || {}) })),
+  };
+  if (args.json) console.log(JSON.stringify(result, null, 2));
+  else {
+    console.log(`\nMedia Library import ${result.job_id}: ${result.status ?? result.job_state} (media seconds used: ${result.media_seconds_used ?? "?"}) · folder ${result.folder_id}${result.error_code ? ` · error_code ${result.error_code}` : ""}`);
+    for (const f of result.files) console.log(`- ${f.name}  ${f.status || "?"}  asset=${f.asset_id || "-"}${f.duration_seconds != null ? `  ${f.duration_seconds}s` : ""}${f.error_message ? `  ${f.error_message}` : ""}`);
   }
   if (result.status !== "success") process.exitCode = EXIT.JOB_FAILED;
 }
@@ -467,11 +559,18 @@ async function publish(args) {
   if (args.callback_url) payload.callback_url = String(args.callback_url);
   if (args.dry_run) return console.log(JSON.stringify(payload, null, 2));
   if (!args.yes) throw new CliError(`Publishing creates a share link for "${compName}" (access ${payload.access_level || "drive default"}). Re-run with --yes after confirming with the user.`);
-  const created = await request("/jobs/publish", { method: "POST", body: JSON.stringify(payload) });
+  let created;
+  try {
+    created = await request("/jobs/publish", { method: "POST", body: JSON.stringify(payload) });
+  } catch (error) {
+    if (error.status === 422) error.message += "\nHint: the composition is probably audio-only; re-run with --media-type Audio.";
+    throw error;
+  }
   console.error(`Publish job ${created.job_id} started`);
   if (!args.wait) return console.log(JSON.stringify(created, null, 2));
   const done = await waitForJob(created.job_id, { intervalSeconds: Number(args.interval || 10), maxAttempts: Number(args.max || 180), quiet: Boolean(args.json) });
-  console.log(JSON.stringify({ ...created, result: done.result }, null, 2));
+  if (!args.json && done.result?.media_type) console.error(`Published as ${done.result.media_type}: ${done.result.share_url || "(no share url)"}`);
+  console.log(JSON.stringify({ ...created, result: done.result, job_state: done.job_state, stopped_at: done.stopped_at }, null, 2));
   if (done.result?.status !== "success") process.exitCode = EXIT.JOB_FAILED;
 }
 
@@ -487,11 +586,27 @@ async function waitForJob(jobId, { intervalSeconds, maxAttempts, quiet = false }
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     last = await request(`/jobs/${encodeURIComponent(jobId)}`);
     if (!quiet) console.error(`[${attempt}/${maxAttempts}] ${last.job_type} ${last.job_state}${last.progress?.label ? ` — ${last.progress.label}${last.progress.percent != null ? ` ${last.progress.percent}%` : ""}` : ""}`);
-    if (last.job_state === "stopped" || last.job_state === "cancelled") return last;
+    if (last.job_state === "stopped" || last.job_state === "cancelled") {
+      if (!quiet && (last.result?.error_code || last.stopped_at)) console.error(`  ${last.job_state}${last.stopped_at ? ` at ${last.stopped_at}` : ""}${last.result?.error_code ? ` · error_code ${last.result.error_code}` : ""}${last.result?.error_message ? ` · ${last.result.error_message}` : ""}`);
+      return last;
+    }
     await sleep(intervalSeconds * 1000);
   }
   console.log(JSON.stringify(last, null, 2));
   throw new CliError(`Timed out waiting for job ${jobId}`, EXIT.TIMEOUT);
+}
+
+// PUT each local file to its signed upload_url (file MIME first, application/octet-stream fallback).
+// `items` need {localPath, mediaName, contentType, fileSize}; `uploadUrls` is the job's upload_urls map keyed by mediaName.
+async function putUploads(items, uploadUrls) {
+  for (const i of items) {
+    const u = uploadUrls?.[i.mediaName]?.upload_url;
+    if (!u) throw new CliError(`No upload URL returned for ${i.mediaName}`);
+    let res = await fetch(u, { method: "PUT", headers: { "Content-Type": i.contentType }, body: readFileSync(i.localPath) });
+    if (!res.ok) res = await fetch(u, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: readFileSync(i.localPath) });
+    if (!res.ok) throw new CliError(`Upload failed for ${i.mediaName}: ${res.status} ${await res.text()}`);
+    console.error(`  uploaded ${i.mediaName} (${(i.fileSize / 1024).toFixed(0)} KB)`);
+  }
 }
 
 function resolvePath(p) { return isAbsolute(p) ? p : resolve(process.cwd(), p); }
